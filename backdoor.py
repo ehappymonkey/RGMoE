@@ -234,7 +234,13 @@ class Backdoor:
             optimizer_trigger.zero_grad()
 
             rs = np.random.RandomState(self.args.seed)
-            idx_outter = torch.cat([idx_attach,idx_unlabeled[rs.choice(len(idx_unlabeled),size=512,replace=False)]])
+
+
+            # 改为取出最多的idx_unlabeled。
+            n_out = min(len(idx_unlabeled), 512)
+            idx_sampled = rs.choice(len(idx_unlabeled), size=n_out, replace=False)
+            idx_outter = torch.cat([idx_attach, idx_unlabeled[idx_sampled]])
+            # idx_outter = torch.cat([idx_attach,idx_unlabeled[rs.choice(len(idx_unlabeled),size=512,replace=False)]])
 
             trojan_feat, trojan_weights = self.trojan(features[idx_outter],self.args.thrd) # may revise the process of generate
         
