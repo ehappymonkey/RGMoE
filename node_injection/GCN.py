@@ -1,0 +1,325 @@
+## from UGBA
+#%%
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from copy import deepcopy
+from torch_geometric.nn import GCNConv
+import numpy as np
+import scipy.sparse as sp
+from torch_geometric.utils import from_scipy_sparse_matrix
+from tqdm import trange
+
+def accuracy(output, labels):
+    """Return accuracy of output compared to labels.
+    Parameters
+    ----------
+    output : torch.Tensor
+        output from model
+    labels : torch.Tensor or numpy.array
+        node labels
+    Returns
+    -------
+    float
+        accuracy
+    """
+    if not hasattr(labels, '__len__'):
+        labels = [labels]
+    if type(labels) is not torch.Tensor:
+        labels = torch.LongTensor(labels)
+    preds = output.max(1)[1].type_as(labels)
+    correct = preds.eq(labels).double()
+    correct = correct.sum()
+    return correct / len(labels)
+
+class GCN(nn.Module):
+    def __init__(self, nfeat, nhid, nclass, dropout=0.5, lr=0.01, weight_decay=5e-4, layer=2,device=None,layer_norm_first=False,use_ln=False):
+
+        super(GCN, self).__init__()
+
+        assert device is not None, "Please specify 'device'!"
+        self.device = device
+        self.nfeat = nfeat
+        self.hidden_sizes = [nhid]
+        self.nclass = nclass
+        self.convs = nn.ModuleList()
+        self.convs.append(GCNConv(nfeat, nhid))
+        self.lns = nn.ModuleList()
+        self.lns.append(torch.nn.LayerNorm(nfeat))
+        for _ in range(layer-2):
+            self.convs.append(GCNConv(nhid,nhid))
+            self.lns.append(nn.LayerNorm(nhid))
+        self.lns.append(nn.LayerNorm(nhid))
+        self.gc2 = GCNConv(nhid, nclass)
+        self.dropout = dropout
+        self.lr = lr
+        self.output = None
+        self.edge_index = None
+        self.edge_weight = None
+        self.features = None 
+        self.weight_decay = weight_decay
+
+        self.layer_norm_first = layer_norm_first
+        self.use_ln = use_ln
+
+    def forward(self, x, edge_index, edge_weight=None):
+        if(self.layer_norm_first):
+            x = self.lns[0](x)
+        i=0
+        for conv in self.convs:
+            x = F.relu(conv(x, edge_index,edge_weight))
+            if self.use_ln:
+                x = self.lns[i+1](x)
+            i+=1
+            x = F.dropout(x, self.dropout, training=self.training)
+        x = self.gc2(x, edge_index,edge_weight)
+        return F.log_softmax(x,dim=1)
+    
+    def get_h(self, x, edge_index):
+
+        for conv in self.convs:
+            x = F.relu(conv(x, edge_index))
+        
+        return x
+
+    def fit(self, features, edge_index, edge_weight, labels, idx_train, idx_val=None, train_iters=200, verbose=False):
+        """Train the gcn model, when idx_val is not None, pick the best model according to the validation loss.
+        Parameters
+        ----------
+        features :
+            node features
+        adj :
+            the adjacency matrix. The format could be torch.tensor or scipy matrix
+        labels :
+            node labels
+        idx_train :
+            node training indices
+        idx_val :
+            node validation indices. If not given (None), GCN training process will not adpot early stopping
+        train_iters : int
+            number of training epochs
+        initialize : bool
+            whether to initialize parameters before training
+        verbose : bool
+            whether to show verbose logs
+        """
+
+        self.edge_index, self.edge_weight = edge_index, edge_weight
+        self.features = features.to(self.device)
+        self.labels = labels.to(self.device)
+
+        if idx_val is None:
+            self._train_without_val(self.labels, idx_train, train_iters, verbose)
+        else:
+            self._train_with_val(self.labels, idx_train, idx_val, train_iters, verbose)
+        # torch.cuda.empty_cache()
+
+    def _train_without_val(self, labels, idx_train, train_iters, verbose):
+        self.train()
+        optimizer = optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        for i in range(train_iters):
+            optimizer.zero_grad()
+            output = self.forward(self.features, self.edge_index, self.edge_weight)
+            loss_train = F.nll_loss(output[idx_train], labels[idx_train])
+            loss_train.backward()
+            optimizer.step()
+            if verbose and i % 10 == 0:
+                print('Epoch {}, training loss: {}'.format(i, loss_train.item()))
+
+        self.eval()
+        output = self.forward(self.features, self.edge_index, self.edge_weight)
+        self.output = output
+        # torch.cuda.empty_cache()
+
+    def _train_with_val(self, labels, idx_train, idx_val, train_iters, verbose):
+        if verbose:
+            print('=== training gcn model ===')
+        optimizer = optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+        best_loss_val = 100
+        best_acc_val = 0
+
+        for i in range(train_iters):
+            self.train()
+            optimizer.zero_grad()
+            output = self.forward(self.features, self.edge_index, self.edge_weight)
+            loss_train = F.nll_loss(output[idx_train], labels[idx_train])
+            loss_train.backward()
+            optimizer.step()
+
+            self.eval()
+            output = self.forward(self.features, self.edge_index, self.edge_weight)
+            loss_val = F.nll_loss(output[idx_val], labels[idx_val])
+            acc_val = accuracy(output[idx_val], labels[idx_val])
+            
+            if verbose and i % 10 == 0:
+                print('Epoch {}, training loss: {}'.format(i, loss_train.item()))
+                print("acc_val: {:.4f}".format(acc_val))
+            if acc_val > best_acc_val:
+                best_acc_val = acc_val
+                self.output = output
+                weights = deepcopy(self.state_dict())
+
+        if verbose:
+            print('=== picking the best model according to the performance on validation ===')
+        self.load_state_dict(weights)
+        # torch.cuda.empty_cache()
+
+    def test(self, features, edge_index, edge_weight,labels,idx_test):
+        """Evaluate GCN performance on test set.
+        Parameters
+        ----------
+        idx_test :
+            node testing indices
+        """
+        self.eval()
+        with torch.no_grad():
+            output = self.forward(features, edge_index, edge_weight)
+            acc_test = accuracy(output[idx_test], labels[idx_test])
+        # torch.cuda.empty_cache()
+        # print("Test set results:",
+        #       "loss= {:.4f}".format(loss_test.item()),
+        #       "accuracy= {:.4f}".format(acc_test.item()))
+        return float(acc_test)
+    
+    def test_with_correct_nodes(self, features, edge_index, edge_weight, labels,idx_test):
+        self.eval()
+        output = self.forward(features, edge_index, edge_weight)
+        correct_nids = (output.argmax(dim=1)[idx_test]==labels[idx_test]).nonzero().flatten()   # return a tensor
+        acc_test = accuracy(output[idx_test], labels[idx_test])
+        # torch.cuda.empty_cache()
+        return acc_test,correct_nids
+
+    # for PoisoningPRBCDAttack
+    def reset_parameters(self):
+        # 重置每个卷积层
+        for conv in self.convs:
+            conv.reset_parameters()
+        self.gc2.reset_parameters()
+
+        # 重置 LayerNorm 层
+        for ln in self.lns:
+            ln.reset_parameters()
+
+class GCN_with_Linear(nn.Module):
+    def __init__(self, in_dim, hidden_dim, num_classes, dropout=0.5):
+        super(GCN_with_Linear, self).__init__()
+        self.conv1 = GCNConv(in_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.classifier = nn.Linear(hidden_dim, num_classes)
+
+        #self.layernorm = nn.LayerNorm(hidden_dim)
+        self.dropout = dropout
+
+    def forward(self, x, edge_index, edge_weight=None):
+        h = self.conv1(x, edge_index, edge_weight)
+        h = F.relu(h)
+        h = F.dropout(h, self.dropout, training=self.training) # self.training/eval对asr和ca有关键影响.
+        logits = self.conv2(h, edge_index, edge_weight)
+
+        # logits = F.relu(logits)
+        # logits = F.dropout(logits, self.dropout, self.training)
+        logits = self.classifier(logits)
+
+        log_probs = F.log_softmax(logits, dim=1)
+        return log_probs  # shape: [N, num_classes]
+
+    def fit(self, features, edge_index, edge_weight, labels, idx_train, train_iters=200, lr=0.01, weight_decay=5e-4):
+        self.train()
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
+        for epoch in trange(train_iters, desc="Training GCN"):
+            self.train()
+            optimizer.zero_grad()
+            log_probs = self.forward(features, edge_index, edge_weight)
+            loss = F.nll_loss(log_probs[idx_train], labels[idx_train])
+            loss.backward()
+            optimizer.step()
+            # if epoch % 50 == 0:
+            #     print(f"Epoch {epoch:03d}, Loss: {loss.item():.4f}")
+        self.eval()
+
+    def get_h(self, x, edge_index, edge_weight=None):
+        self.eval()
+        with torch.no_grad():
+            h = self.conv1(x, edge_index, edge_weight)
+            h = F.relu(h)
+            # h = self.layernorm(h)
+            h = F.dropout(h, self.dropout, self.training)
+        return h.detach()
+
+    def test(self, features, edge_index, edge_weight,labels,idx_test):
+        """Evaluate GCN performance on test set.
+        Parameters
+        ----------
+        idx_test :
+            node testing indices
+        """
+        self.eval()
+        with torch.no_grad():
+            output = self.forward(features, edge_index, edge_weight)
+            acc_test = accuracy(output[idx_test], labels[idx_test])
+        # torch.cuda.empty_cache()
+        # print("Test set results:",
+        #       "loss= {:.4f}".format(loss_test.item()),
+        #       "accuracy= {:.4f}".format(acc_test.item()))
+        return float(acc_test)
+
+    def reset_parameters(self):
+        self.conv1.reset_parameters()
+        self.conv2.reset_parameters()
+        self.classifier.reset_parameters()
+
+class GCN_Surrogate(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers,
+                 dropout, layer_norm_first=False, use_ln=True):
+        super(GCN_Surrogate, self).__init__()
+        self.layer_norm_first = layer_norm_first
+        self.use_ln = use_ln
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(GCNConv(in_channels, hidden_channels, cached=False))
+        self.lns = torch.nn.ModuleList()
+        self.lns.append(torch.nn.LayerNorm(in_channels))
+        for _ in range(num_layers - 2):
+            self.convs.append(
+                GCNConv(hidden_channels, hidden_channels, cached=False))
+            self.lns.append(torch.nn.LayerNorm(hidden_channels))
+        self.lns.append(torch.nn.LayerNorm(hidden_channels))
+        self.convs.append(GCNConv(hidden_channels, out_channels, cached=False))
+
+        self.dropout = dropout
+
+    def reset_parameters(self):
+        for conv in self.convs:
+            conv.reset_parameters()
+        for ln in self.lns:
+            ln.reset_parameters()
+
+    def forward(self, x, adj_t, layers=-1):
+        if self.layer_norm_first:
+            x = self.lns[0](x)
+        for i, conv in enumerate(self.convs[:-1]):
+            x = conv(x, adj_t)
+            if self.use_ln:
+                x = self.lns[i+1](x)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            # obtain output from the i-th layer
+            if layers == i+1:
+                return x
+        x = self.convs[-1](x, adj_t)
+        return x.log_softmax(dim=-1)
+
+    def con_forward(self,x,adj_t,layers=-1):
+        if self.layer_norm_first and layers==1:
+            x = self.lns[0](x)
+        for i in range(layers-1,len(self.convs)-1):
+            x = self.convs[i](x, adj_t)
+            if self.use_ln:
+                x = self.lns[i+1](x)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.convs[-1](x, adj_t)
+        return x.log_softmax(dim=-1)
+
+# %%
